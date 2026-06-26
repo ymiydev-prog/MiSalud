@@ -165,3 +165,66 @@ class NutritionCoach:
         except Exception as e:
             logger.exception("AI chat error")
             return f"Error al contactar con la IA. Intenta de nuevo en un momento."
+
+    def _parse_meal_text(self, user_text: str) -> Optional[dict]:
+        """Parse a free-text meal description into structured foods using DeepSeek.
+        
+        Returns dict with 'meal_type', 'foods' list, and 'totals'.
+        """
+        if not self.api_key:
+            return None
+
+        prompt = f"""Analiza esta descripcion de comida y devuelve SOLO un JSON (sin markdown, sin texto extra):
+
+"{user_text}"
+
+Usa este esquema exacto:
+{{
+  "meal_type": "Desayuno",
+  "foods": [
+    {{"name": "nombre en espanol", "portion_g": 150, "calories": 200, "protein_g": 15.0, "carbs_g": 20.0, "fat_g": 8.0, "fiber_g": 3.0}}
+  ],
+  "totals": {{"calories": 500, "protein_g": 35.0, "carbs_g": 45.0, "fat_g": 18.0, "fiber_g": 6.0}}
+}}
+
+Reglas:
+1. Identifica CADA alimento mencionado como un food separado
+2. Estima porciones realistas en gramos
+3. Usa valores nutricionales precisos (USDA)
+4. Detecta el tipo de comida (Desayuno/Almuerzo/Cena/Merienda) segun los alimentos
+5. Nada de explicaciones, solo el JSON"""
+
+        try:
+            resp = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": 800,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            text = resp.json()["choices"][0]["message"]["content"].strip()
+
+            # Parse JSON from response
+            import re
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                pass
+            m = re.search(r'\{[\s\S]*\}', text)
+            if m:
+                try:
+                    return json.loads(m.group(0))
+                except json.JSONDecodeError:
+                    pass
+            return None
+        except Exception as e:
+            logger.exception("Meal text parsing failed")
+            return None

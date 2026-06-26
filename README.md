@@ -79,10 +79,13 @@ python -c "from src.telegram_handler import MiSaludBot; MiSaludBot().run_sync()"
 
 | Comando | Descripción |
 |---------|-------------|
-| 📸 Enviar foto | Analiza la comida con IA |
+| 📸 Enviar foto | Analiza la comida con IA (qwen3-vl + DeepSeek) |
+| `/comida <texto>` | Registra comida por descripción de texto |
 | `/resumen` | Resumen nutricional del día |
 | `/peso 85.5` | Registra tu peso |
 | `/entreno running 45` | Registra un entrenamiento |
+| `/coach <pregunta>` | Habla con el nutricionista IA |
+| `/menu` | Muestra el teclado de botones |
 | `/ayuda` | Muestra la ayuda |
 
 ## Cron Jobs

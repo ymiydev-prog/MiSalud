@@ -98,13 +98,23 @@ class FoodAnalyzer:
             "prompt": FOOD_ANALYSIS_PROMPT,
             "images": [image_b64],
             "stream": False,
-            "options": {"temperature": 0.1, "num_predict": 1024},
+            "options": {"temperature": 0.1, "num_predict": 4096},
         }
 
         try:
             resp = requests.post(self.api_url, json=payload, timeout=120)
             resp.raise_for_status()
-            response_text = resp.json().get("response", "").strip()
+            data = resp.json()
+            # qwen3-vl uses thinking mode — response is empty, thinking has the analysis
+            response_text = data.get("response", "").strip()
+            thinking_text = data.get("thinking", "").strip()
+
+            # If response is empty but thinking has content, use thinking + LLM extraction
+            if not response_text and thinking_text:
+                logger.info("Vision model used thinking mode — extracting JSON via LLM")
+                response_text = self._extract_json_from_thinking(thinking_text)
+            elif not response_text:
+                logger.warning("Vision model returned empty response and thinking")
         except requests.exceptions.ConnectionError:
             return {
                 "error": f"Cannot connect to Ollama at {self.base_url}. "
@@ -156,6 +166,60 @@ class FoodAnalyzer:
 
         logger.warning("Could not parse JSON from response: %s", text[:300])
         return None
+
+    def _extract_json_from_thinking(self, thinking_text: str) -> str:
+        """Use DeepSeek to convert qwen3-vl thinking text into proper JSON."""
+        import os
+        from dotenv import load_dotenv
+        from pathlib import Path
+        load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+        load_dotenv(Path.home() / ".hermes" / ".env")
+
+        api_key = (os.getenv("MISALUD_DEEPSEEK_KEY", "") or os.getenv("DEEPSEEK_API_KEY", ""))
+        if not api_key:
+            logger.warning("No DeepSeek API key — falling back to raw thinking text")
+            return thinking_text
+
+        # Truncate thinking text to fit
+        truncated = thinking_text[:3000]
+
+        prompt = f"""Extract the food analysis from this AI reasoning text and return ONLY a JSON object (no markdown, no extra text):
+
+{truncated}
+
+Return this exact JSON schema:
+{{
+  "meal_type": "almuerzo",
+  "foods": [
+    {{"name": "food name in Spanish", "portion_g": 150, "calories": 200, "protein_g": 15.0, "carbs_g": 20.0, "fat_g": 8.0, "fiber_g": 3.0}}
+  ],
+  "totals": {{"calories": 500, "protein_g": 35.0, "carbs_g": 45.0, "fat_g": 18.0, "fiber_g": 6.0}},
+  "confidence": "medium",
+  "notes": "brief notes in Spanish"
+}}"""
+
+        try:
+            resp = requests.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "deepseek-chat",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": 800,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            result = resp.json()["choices"][0]["message"]["content"].strip()
+            logger.info("DeepSeek extracted JSON from thinking: %s", result[:100])
+            return result
+        except Exception as e:
+            logger.exception("DeepSeek extraction failed, falling back to thinking text")
+            return thinking_text
 
     def analyze_and_save(self, image_path: str | Path, meal_type: str = None) -> dict:
         """Analyze photo and persist result to a JSON sidecar file.

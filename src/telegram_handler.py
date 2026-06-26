@@ -28,8 +28,9 @@ logger = logging.getLogger(__name__)
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📊 Resumen"), KeyboardButton("⚖️ Peso")],
-        [KeyboardButton("🏋️ Entreno"), KeyboardButton("🧠 Coach")],
-        [KeyboardButton("📸 Analizar comida"), KeyboardButton("❓ Ayuda")],
+        [KeyboardButton("🍽️ Comida"), KeyboardButton("🏋️ Entreno")],
+        [KeyboardButton("🧠 Coach"), KeyboardButton("📸 Analizar comida")],
+        [KeyboardButton("❓ Ayuda")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Elige una opción o escríbeme...",
@@ -157,6 +158,15 @@ class MiSaludBot:
             parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD,
         )
 
+    async def _comida_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "🍽️ *Registrar comida por texto*\n\n"
+            "Describe lo que comiste. Ejemplo:\n"
+            "`pollo con arroz y ensalada`\n\n"
+            "O usa el comando: `/comida 2 huevos, pan, cafe`",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD,
+        )
+
     # ── /resumen ───────────────────────────────────
 
     async def resumen_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -267,6 +277,68 @@ class MiSaludBot:
             parse_mode=ParseMode.MARKDOWN,
         )
 
+    # ── /comida ──────────────────────────────────────
+
+    async def comida_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Register a meal by text description. Uses DeepSeek to parse foods."""
+        if not context.args:
+            await update.message.reply_text(
+                "🍽️ *Registrar comida por texto*\n\n"
+                "Describe lo que comiste y la IA lo analizará. Ejemplos:\n"
+                "`/comida 2 huevos fritos, pan integral, café con leche`\n"
+                "`/comida ensalada de pollo con aguacate y nueces`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        user_text = " ".join(context.args)
+        await update.message.reply_chat_action("typing")
+
+        # Parse food via DeepSeek
+        try:
+            result = self.coach._parse_meal_text(user_text)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error al analizar: {e}")
+            return
+
+        if not result or not result.get("foods"):
+            await update.message.reply_text(
+                "❌ No pude identificar los alimentos. Intenta con más detalle."
+            )
+            return
+
+        # Save to database
+        try:
+            with MiSaludRepo() as repo:
+                meal = repo.add_meal(
+                    meal_type_name=result.get("meal_type", "Comida"),
+                    eaten_at=datetime.now(),
+                    confidence="medium",
+                )
+                for food in result.get("foods", []):
+                    repo.add_food_to_meal(meal.id, food)
+        except Exception as e:
+            logger.exception("Failed to save meal")
+            await update.message.reply_text(f"⚠️ Error al guardar: {e}")
+            return
+
+        # Build response
+        foods_text = "\n".join(
+            f"• *{f['name']}*: {f.get('calories', 0):.0f} kcal"
+            for f in result["foods"]
+        )
+        totals = result.get("totals", {})
+        msg = (
+            f"✅ *{result.get('meal_type', 'Comida')} guardada*\n\n"
+            f"{foods_text}\n\n"
+            f"📊 *Totales:*\n"
+            f"🔥 Calorías: *{totals.get('calories', 0):.0f} kcal*\n"
+            f"💪 Proteínas: *{totals.get('protein_g', 0):.0f} g*\n"
+            f"🍚 Carbohidratos: *{totals.get('carbs_g', 0):.0f} g*\n"
+            f"🧈 Grasas: *{totals.get('fat_g', 0):.0f} g*"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
     # ── Photo handler ──────────────────────────────
 
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -352,6 +424,7 @@ class MiSaludBot:
         button_handlers = {
             "📊 Resumen": self.resumen_cmd,
             "⚖️ Peso": self._peso_button,
+            "🍽️ Comida": self._comida_button,
             "🏋️ Entreno": self._entreno_button,
             "🧠 Coach": self._coach_button,
             "📸 Analizar comida": self._photo_button,
@@ -395,6 +468,7 @@ class MiSaludBot:
         app.add_handler(CommandHandler("resumen", self.resumen_cmd))
         app.add_handler(CommandHandler("peso", self.peso_cmd))
         app.add_handler(CommandHandler("entreno", self.entreno_cmd))
+        app.add_handler(CommandHandler("comida", self.comida_cmd))
         app.add_handler(CommandHandler("coach", self.coach_cmd))
         app.add_handler(CommandHandler("reset", self.reset_coach_cmd))
         app.add_handler(CommandHandler("menu", self.menu_cmd))

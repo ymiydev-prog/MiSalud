@@ -35,7 +35,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("MISALUD_TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("MISALUD_TELEGRAM_CHAT_ID", "")
 
 # ── IA / Visión ─────────────────────────────────────
-VISION_MODEL = "qwen2.5vl"
+VISION_MODEL = "qwen3-vl:latest"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # ── Perfil del usuario ──────────────────────────────

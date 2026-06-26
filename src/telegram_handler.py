@@ -37,18 +37,23 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 WELCOME_MSG = (
-    "🥗 *MiSalud Bot*\\n\\n"
+    "🥗 *MiSalud Bot*\n\n"
     "Envíame una foto de tu comida y la analizaré con IA para estimar "
-    "calorías, proteínas, carbohidratos y grasas.\\n\\n"
+    "calorías, proteínas, carbohidratos y grasas.\n\n"
     "🧠 *Háblame!* Soy tu coach nutricional con IA. "
-    "Pregúntame lo que quieras sobre alimentación, recetas, entrenamiento...\\n\\n"
-    "📸 *Comandos:*\\n"
-    "/resumen — Resumen nutricional del día\\n"
-    "/peso <kg> — Registra tu peso (ej: /peso 85.5)\\n"
-    "/entreno <tipo> <minutos> — Registra entrenamiento\\n"
-    "/coach <pregunta> — Habla con el nutricionista IA\\n"
-    "/reset — Reinicia la memoria del coach\\n"
-    "/menu — Mostrar/ocultar teclado\\n"
+    "Pregúntame lo que quieras sobre alimentación, recetas, entrenamiento...\n\n"
+    "📸 *Comandos:*\n"
+    "/resumen — Resumen nutricional del día\n"
+    "/comida <texto> — Registra comida por descripción\n"
+    "/editar <cambio> — Corrige la última comida\n"
+    "/borrar — Borra la última comida\n"
+    "/peso <kg> — Registra tu peso\n"
+    "/entreno <tipo> <min> — Registra entrenamiento\n"
+    "/objetivo <kcal> — Cambia tu objetivo calórico\n"
+    "/hoy — Pasos y actividad de Google Fit\n"
+    "/coach <pregunta> — Habla con el nutricionista IA\n"
+    "/reset — Reinicia la memoria del coach\n"
+    "/menu — Mostrar teclado\n"
     "/ayuda — Esta ayuda"
 )
 
@@ -401,53 +406,145 @@ class MiSaludBot:
             return
 
         correction = " ".join(context.args)
+
         with MiSaludRepo() as repo:
-            from src.database import SessionLocal
-            db = SessionLocal()
-            last_meal = db.query(db.__class__).get(1)  # placeholder
-            from src.models import Meal
-            last_meal = db.query(Meal).order_by(Meal.id.desc()).first()
+            last_meal = repo.get_last_meal()
             if not last_meal:
                 await update.message.reply_text("❌ No hay comidas para editar.")
-                db.close()
                 return
 
-            # Use DeepSeek to parse the correction and update foods
-            try:
-                prompt = f"""El usuario quiere corregir la comida. Descripcion original: {last_meal.foods_list}. Correccion: {correction}. Devuelve SOLO un JSON con los alimentos corregidos usando este esquema: {{"foods":[{{"name":"...","portion_g":100,"calories":200,"protein_g":10,"carbs_g":20,"fat_g":5,"fiber_g":2}}]}}"""
-                resp = __import__('requests').post(
-                    f"{self.coach.base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {self.coach.api_key}", "Content-Type": "application/json"},
-                    json={"model": self.coach.model, "messages": [{"role":"user","content":prompt}], "temperature":0.1, "max_tokens":600},
-                    timeout=30,
-                )
-                data = resp.json()["choices"][0]["message"]["content"].strip()
-                import re, json
-                m = re.search(r'\{[\s\S]*\}', data)
-                if m:
-                    new_foods = json.loads(m.group(0)).get("foods", [])
-                    if new_foods:
-                        # Delete old foods
-                        from src.models import MealFood
-                        db.query(MealFood).filter_by(meal_id=last_meal.id).delete()
-                        # Add new foods
-                        for f in new_foods:
-                            mf = MealFood(meal_id=last_meal.id, **{k: v for k, v in f.items() if hasattr(MealFood, k)})
-                            db.add(mf)
-                        db.commit()
-                        total = sum(f.get("calories", 0) for f in new_foods)
-                        db.close()
-                        await update.message.reply_text(
-                            f"✅ Comida actualizada: {', '.join(f['name'] for f in new_foods)}\n"
-                            f"🔥 Nuevo total: {total:.0f} kcal"
-                        )
-                        return
-            except Exception as e:
-                pass
-            finally:
-                db.close()
+            # Use DeepSeek to parse the correction
+            result = self.coach._parse_meal_text(
+                f"{last_meal.foods_list}. Cambios: {correction}"
+            )
 
-        await update.message.reply_text("❌ No pude procesar la corrección. Intenta: `/editar pollo → atun`")
+            if not result or not result.get("foods"):
+                await update.message.reply_text(
+                    "❌ No pude procesar la corrección. Intenta: `/editar pollo → atun`"
+                )
+                return
+
+            success = repo.replace_meal_foods(last_meal.id, result["foods"])
+            if not success:
+                await update.message.reply_text("❌ Error al actualizar la base de datos.")
+                return
+
+            total = sum(f.get("calories", 0) for f in result["foods"])
+            foods_names = ", ".join(f["name"] for f in result["foods"])
+            await update.message.reply_text(
+                f"✅ *Comida actualizada*\n\n"
+                f"{foods_names}\n"
+                f"🔥 Nuevo total: *{total:.0f} kcal*",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+    # ── /borrar ──────────────────────────────────────
+
+    async def borrar_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Delete the last meal."""
+        with MiSaludRepo() as repo:
+            last_meal = repo.get_last_meal()
+            if not last_meal:
+                await update.message.reply_text("❌ No hay comidas para borrar.")
+                return
+
+            foods = last_meal.foods_list or "(vacía)"
+            cal = last_meal.total_calories
+            meal_id = last_meal.id
+
+            if repo.delete_meal(meal_id):
+                await update.message.reply_text(
+                    f"🗑️ *Comida borrada*\n\n"
+                    f"{last_meal.meal_type.name}: {foods}\n"
+                    f"({cal:.0f} kcal)",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            else:
+                await update.message.reply_text("❌ Error al borrar.")
+
+    # ── /objetivo ────────────────────────────────────
+
+    async def objetivo_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set calorie goal: /objetivo 2200 [proteína] [carbos] [grasas]"""
+        if not context.args:
+            with MiSaludRepo() as repo:
+                goal = repo.get_active_goal()
+                if goal:
+                    await update.message.reply_text(
+                        f"🎯 *Objetivo actual*\n\n"
+                        f"🔥 Calorías: *{goal.daily_calories}* kcal/día\n"
+                        f"💪 Proteína: *{goal.protein_g}* g\n"
+                        f"🍚 Carbos: *{goal.carbs_g}* g\n"
+                        f"🧈 Grasas: *{goal.fat_g}* g\n\n"
+                        f"Para cambiar: `/objetivo 2200`",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                else:
+                    await update.message.reply_text(
+                        "🎯 No hay objetivo activo.\n"
+                        "Configura: `/objetivo 2200`",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+            return
+
+        try:
+            calories = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Inválido. Ejemplo: `/objetivo 2200`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        # Optional macros
+        protein = int(context.args[1]) if len(context.args) > 1 else int(calories * 0.3 / 4)
+        carbs = int(context.args[2]) if len(context.args) > 2 else int(calories * 0.4 / 4)
+        fat = int(context.args[3]) if len(context.args) > 3 else int(calories * 0.3 / 9)
+
+        with MiSaludRepo() as repo:
+            repo.set_goal(
+                goal_type="maintain",
+                daily_calories=calories,
+                protein_g=protein,
+                carbs_g=carbs,
+                fat_g=fat,
+            )
+
+        await update.message.reply_text(
+            f"✅ *Objetivo actualizado*\n\n"
+            f"🔥 Calorías: *{calories}* kcal/día\n"
+            f"💪 Proteína: *{protein}* g\n"
+            f"🍚 Carbos: *{carbs}* g\n"
+            f"🧈 Grasas: *{fat}* g",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    # ── /hoy ─────────────────────────────────────────
+
+    async def hoy_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show today's activity from Google Fit."""
+        with MiSaludRepo() as repo:
+            fit = repo.get_today_fit()
+
+        if not fit:
+            await update.message.reply_text(
+                "📊 Sin datos de Google Fit hoy.\n"
+                "La sincronización corre a las 8:00 AM."
+            )
+            return
+
+        msg = (
+            f"📊 *Actividad de Hoy*\n\n"
+            f"👣 Pasos: *{fit.steps:,}*\n"
+            f"🔥 Calorías activas: *{fit.active_calories}*\n"
+            f"⏱️ Minutos activos: *{fit.active_minutes}*"
+        )
+        if fit.sleep_hours:
+            msg += f"\n😴 Sueño: *{fit.sleep_hours} h*"
+        if fit.weight_kg:
+            msg += f"\n⚖️ Peso: *{fit.weight_kg} kg*"
+
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
     # ── /coach ─────────────────────────────────────
 
@@ -532,6 +629,9 @@ class MiSaludBot:
         app.add_handler(CommandHandler("entreno", self.entreno_cmd))
         app.add_handler(CommandHandler("comida", self.comida_cmd))
         app.add_handler(CommandHandler("editar", self.editar_cmd))
+        app.add_handler(CommandHandler("borrar", self.borrar_cmd))
+        app.add_handler(CommandHandler("objetivo", self.objetivo_cmd))
+        app.add_handler(CommandHandler("hoy", self.hoy_cmd))
         app.add_handler(CommandHandler("coach", self.coach_cmd))
         app.add_handler(CommandHandler("reset", self.reset_coach_cmd))
         app.add_handler(CommandHandler("menu", self.menu_cmd))

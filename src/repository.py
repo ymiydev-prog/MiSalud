@@ -168,6 +168,50 @@ class MiSaludRepo:
 
     # ── Workouts ─────────────────────────────────────
 
+    def get_last_meal(self) -> Optional[models.Meal]:
+        """Get the most recent meal."""
+        return (
+            self.db.query(models.Meal)
+            .order_by(models.Meal.id.desc())
+            .first()
+        )
+
+    def delete_meal(self, meal_id: int) -> bool:
+        """Delete a meal and all its foods (cascade)."""
+        meal = self.db.query(models.Meal).get(meal_id)
+        if meal:
+            self.db.delete(meal)
+            self.db.commit()
+            return True
+        return False
+
+    def replace_meal_foods(self, meal_id: int, foods: list[dict]) -> bool:
+        """Replace all foods in a meal with a new list."""
+        from .database import SessionLocal
+        db = SessionLocal()
+        try:
+            db.query(models.MealFood).filter_by(meal_id=meal_id).delete()
+            for i, f in enumerate(foods):
+                mf = models.MealFood(
+                    meal_id=meal_id,
+                    food_name=f["name"],
+                    portion_g=f.get("portion_g"),
+                    calories=f.get("calories"),
+                    protein_g=f.get("protein_g"),
+                    carbs_g=f.get("carbs_g"),
+                    fat_g=f.get("fat_g"),
+                    fiber_g=f.get("fiber_g"),
+                    food_order=i + 1,
+                )
+                db.add(mf)
+            db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            return False
+        finally:
+            db.close()
+
     def add_workout(
         self,
         type_name: str,

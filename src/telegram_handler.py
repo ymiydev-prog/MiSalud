@@ -387,6 +387,68 @@ class MiSaludBot:
         msg += f"\n\n📸 _Foto guardada: {photo_path.name}_"
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
+    # ── /editar ──────────────────────────────────────
+
+    async def editar_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Edit the most recent meal: /editar pollo → atun"""
+        if not context.args:
+            await update.message.reply_text(
+                "✏️ *Editar última comida*\n\n"
+                "Corrige la última comida registrada. Ejemplo:\n"
+                "`/editar pollo → atun, mayonesa → yogur`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        correction = " ".join(context.args)
+        with MiSaludRepo() as repo:
+            from src.database import SessionLocal
+            db = SessionLocal()
+            last_meal = db.query(db.__class__).get(1)  # placeholder
+            from src.models import Meal
+            last_meal = db.query(Meal).order_by(Meal.id.desc()).first()
+            if not last_meal:
+                await update.message.reply_text("❌ No hay comidas para editar.")
+                db.close()
+                return
+
+            # Use DeepSeek to parse the correction and update foods
+            try:
+                prompt = f"""El usuario quiere corregir la comida. Descripcion original: {last_meal.foods_list}. Correccion: {correction}. Devuelve SOLO un JSON con los alimentos corregidos usando este esquema: {{"foods":[{{"name":"...","portion_g":100,"calories":200,"protein_g":10,"carbs_g":20,"fat_g":5,"fiber_g":2}}]}}"""
+                resp = __import__('requests').post(
+                    f"{self.coach.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.coach.api_key}", "Content-Type": "application/json"},
+                    json={"model": self.coach.model, "messages": [{"role":"user","content":prompt}], "temperature":0.1, "max_tokens":600},
+                    timeout=30,
+                )
+                data = resp.json()["choices"][0]["message"]["content"].strip()
+                import re, json
+                m = re.search(r'\{[\s\S]*\}', data)
+                if m:
+                    new_foods = json.loads(m.group(0)).get("foods", [])
+                    if new_foods:
+                        # Delete old foods
+                        from src.models import MealFood
+                        db.query(MealFood).filter_by(meal_id=last_meal.id).delete()
+                        # Add new foods
+                        for f in new_foods:
+                            mf = MealFood(meal_id=last_meal.id, **{k: v for k, v in f.items() if hasattr(MealFood, k)})
+                            db.add(mf)
+                        db.commit()
+                        total = sum(f.get("calories", 0) for f in new_foods)
+                        db.close()
+                        await update.message.reply_text(
+                            f"✅ Comida actualizada: {', '.join(f['name'] for f in new_foods)}\n"
+                            f"🔥 Nuevo total: {total:.0f} kcal"
+                        )
+                        return
+            except Exception as e:
+                pass
+            finally:
+                db.close()
+
+        await update.message.reply_text("❌ No pude procesar la corrección. Intenta: `/editar pollo → atun`")
+
     # ── /coach ─────────────────────────────────────
 
     async def coach_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -469,6 +531,7 @@ class MiSaludBot:
         app.add_handler(CommandHandler("peso", self.peso_cmd))
         app.add_handler(CommandHandler("entreno", self.entreno_cmd))
         app.add_handler(CommandHandler("comida", self.comida_cmd))
+        app.add_handler(CommandHandler("editar", self.editar_cmd))
         app.add_handler(CommandHandler("coach", self.coach_cmd))
         app.add_handler(CommandHandler("reset", self.reset_coach_cmd))
         app.add_handler(CommandHandler("menu", self.menu_cmd))

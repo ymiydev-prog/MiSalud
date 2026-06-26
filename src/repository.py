@@ -39,9 +39,17 @@ class MiSaludRepo:
         notes: str = None,
     ) -> models.Meal:
         """Create a new meal record (without foods).  Use add_food_to_meal next."""
-        meal_type = self.db.query(models.MealType).filter_by(name=meal_type_name).first()
+        # Normalize: case-insensitive lookup, capitalize first letter
+        meal_type = (
+            self.db.query(models.MealType)
+            .filter(models.MealType.name.ilike(meal_type_name))
+            .first()
+        )
         if not meal_type:
-            raise ValueError(f"Unknown meal type: {meal_type_name}")
+            # Try creating it as a new type
+            meal_type = models.MealType(name=meal_type_name.capitalize())
+            self.db.add(meal_type)
+            self.db.commit()
 
         meal = models.Meal(
             meal_type_id=meal_type.id,

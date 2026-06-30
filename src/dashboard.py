@@ -153,30 +153,33 @@ with tab_meals:
     st.subheader(f"🍽️ Comidas del {start_dt} al {end_dt}")
     
     from src.models import Meal, MealFood, MealType
+    from sqlalchemy.orm import joinedload
     db = SessionLocal()
     meals_data = (
         db.query(Meal)
+        .options(joinedload(Meal.foods), joinedload(Meal.meal_type))
         .filter(Meal.eaten_at >= datetime.combine(start_dt, datetime.min.time()),
                 Meal.eaten_at <= datetime.combine(end_dt, datetime.max.time()))
         .order_by(Meal.eaten_at.desc())
         .all()
     )
+    # Build data while session is still open
+    rows = []
+    for m in meals_data:
+        foods = ", ".join(f"{f.food_name} ({f.calories or 0:.0f}kcal)" for f in m.foods)
+        rows.append({
+            "Fecha": m.eaten_at.strftime("%d/%m/%Y"),
+            "Hora": m.eaten_at.strftime("%H:%M"),
+            "Tipo": m.meal_type.name,
+            "Alimentos": foods if foods else "(vacio)",
+            "Calorías": m.total_calories or 0,
+            "Proteína": m.total_protein or 0,
+            "Carbos": m.total_carbs or 0,
+            "Grasas": m.total_fat or 0,
+        })
     db.close()
     
-    if meals_data:
-        rows = []
-        for m in meals_data:
-            foods = ", ".join(f"{f.food_name} ({f.calories or 0:.0f}kcal)" for f in m.foods)
-            rows.append({
-                "Fecha": m.eaten_at.strftime("%d/%m/%Y"),
-                "Hora": m.eaten_at.strftime("%H:%M"),
-                "Tipo": m.meal_type.name,
-                "Alimentos": foods if foods else "(vacio)",
-                "Calorías": m.total_calories or 0,
-                "Proteína": m.total_protein or 0,
-                "Carbos": m.total_carbs or 0,
-                "Grasas": m.total_fat or 0,
-            })
+    if rows:
         df = pd.DataFrame(rows)
         st.dataframe(df, use_container_width=True, hide_index=True, column_config={
             "Calorías": st.column_config.NumberColumn(format="%.0f"),

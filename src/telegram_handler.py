@@ -1,14 +1,18 @@
 """Telegram bot handler for MiSalud.
 
-Receives food photos → AI analysis → SQLite storage.
-Commands: /start, /ayuda, /resumen, /peso, /entreno
+Receives food photos -> AI analysis -> SQLite storage.
+Supports barcode scanning, voice transcription, and smart recipes.
 """
 import asyncio
+import json
 import logging
+import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import requests
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes,
@@ -344,10 +348,108 @@ class MiSaludBot:
         )
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-    # ── Photo handler ──────────────────────────────
+    # ── Photo handler removed — replaced by enhanced version below ──
+
+    # ── /receta ──────────────────────────────────────
+
+    async def receta_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Generate a recipe suggestion based on what you've eaten today."""
+        if not context.args:
+            await update.message.reply_text(
+                "👨‍🍳 *Recetas inteligentes*\n\n"
+                "Te sugiero recetas según lo que has comido hoy y tus macros restantes.\n\n"
+                "Ejemplos:\n"
+                "`/receta cena alta en proteínas`\n"
+                "`/receta algo ligero con pollo`\n"
+                "`/receta postre bajo en calorías`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        
+        query = " ".join(context.args)
+        await update.message.reply_chat_action("typing")
+        
+        # Get today's nutrition context
+        with MiSaludRepo() as repo:
+            from datetime import date
+            nutrition = repo.daily_nutrition(date.today())
+            goal = repo.get_active_goal()
+        
+        remaining_cal = (goal.daily_calories - nutrition["calories"]) if goal else "?"
+        remaining_prot = (goal.protein_g - nutrition["protein_g"]) if goal else "?"
+        
+        context_text = (
+            f"Hoy has consumido {nutrition['calories']:.0f} kcal, "
+            f"{nutrition['protein_g']:.0f}g proteína. "
+            f"Te quedan ~{remaining_cal} kcal y {remaining_prot}g proteína."
+        )
+        
+        # Use DeepSeek to generate a recipe
+        prompt = (
+            f"Eres un chef de cocina saludable. {context_text} "
+            f"El usuario pide: '{query}'. "
+            f"Recomienda UNA receta con: nombre, ingredientes con cantidades, "
+            f"instrucciones breves, calorías estimadas, proteínas, carbos y grasas. "
+            f"Responde en español con formato bonito."
+        )
+        
+        reply = self.coach.chat(prompt)
+        await update.message.reply_text(reply)
+
+    # ── /editar ──────────────────────────────────────
+
+    @staticmethod
+    def _lookup_barcode(barcode: str) -> Optional[dict]:
+        """Look up a barcode in Open Food Facts API. Returns food data or None."""
+        try:
+            url = f"https://world.openfoodfacts.net/api/v2/product/{barcode}.json"
+            resp = requests.get(url, timeout=10, headers={"User-Agent": "MiSalud/1.0"})
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            product = data.get("product", {})
+            if not product:
+                return None
+            
+            name = product.get("product_name", "Producto")
+            if not name and "categories" in product:
+                name = product["categories"].split(",")[0]
+            
+            per100 = product.get("nutriments", {})
+            
+            return {
+                "name": name,
+                "brand": product.get("brands", ""),
+                "barcode": barcode,
+                "portion_g": 100,
+                "calories": per100.get("energy-kcal_100g") or per100.get("energy_100g", 0),
+                "protein_g": per100.get("proteins_100g", 0),
+                "carbs_g": per100.get("carbohydrates_100g", 0),
+                "fat_g": per100.get("fat_100g", 0),
+                "fiber_g": per100.get("fiber_100g", 0),
+                "sodium_g": per100.get("sodium_100g", 0),
+                "sugars_g": per100.get("sugars_100g", 0),
+                "serving_size": product.get("serving_size", "100g"),
+                "image_url": product.get("image_url", ""),
+            }
+        except Exception as e:
+            logger.warning(f"Barcode lookup failed: {e}")
+            return None
+
+    @staticmethod
+    def _detect_barcode_in_text(text: str) -> Optional[str]:
+        """Extract a barcode number from AI vision text description."""
+        # Look for 8-13 digit numbers that could be barcodes
+        matches = re.findall(r'\\b(\\d{8,13})\\b', text)
+        for m in matches:
+            if len(m) in (8, 12, 13):
+                return m
+        return None
+
+    # ── Enhanced photo handler with barcode detection ──
 
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Receive food photo, analyze with AI, store in SQLite."""
+        """Receive food photo, analyze with AI, detect barcodes, store in SQLite."""
         user = update.message.from_user
 
         # Download photo
@@ -356,9 +458,67 @@ class MiSaludBot:
         photo_path = PHOTOS_DIR / f"{timestamp}_{user.id}.jpg"
         await photo_file.download_to_drive(photo_path)
 
-        await update.message.reply_text("🔍 *Analizando tu comida con IA...*", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("🔍 *Analizando imagen...*", parse_mode=ParseMode.MARKDOWN)
 
-        # Analyze
+        # First try: detect if this is a barcode
+        detection_prompt = "Look at this image. If there is a barcode or QR code visible, write ONLY the numbers. If not, write 'NO BARCODE'."
+        try:
+            import base64
+            with open(photo_path, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode()
+            
+            detect_resp = requests.post(
+                f"{self.analyzer.base_url}/api/generate",
+                json={
+                    "model": self.analyzer.model,
+                    "prompt": detection_prompt,
+                    "images": [img_b64],
+                    "stream": False,
+                    "options": {"num_predict": 512},
+                },
+                timeout=30,
+            )
+            detect_text = detect_resp.json().get("thinking", "") + detect_resp.json().get("response", "")
+            barcode = self._detect_barcode_in_text(detect_text)
+        except Exception:
+            barcode = None
+
+        if barcode:
+            # Barcode detected - look up product
+            product = self._lookup_barcode(barcode)
+            if product:
+                msg = (
+                    f"📦 *Producto encontrado:* {product['name']}\n"
+                    f"🏷️ {product.get('brand', '')}\n\n"
+                    f"📊 *Por 100g:*\n"
+                    f"🔥 Calorías: *{product['calories']:.0f}* kcal\n"
+                    f"💪 Proteínas: *{product['protein_g']:.1f}* g\n"
+                    f"🍚 Carbohidratos: *{product['carbs_g']:.1f}* g\n"
+                    f"🧈 Grasas: *{product['fat_g']:.1f}* g"
+                )
+                if product.get("fiber_g"):
+                    msg += f"\n🌿 Fibra: *{product['fiber_g']:.1f}* g"
+                msg += f"\n\n📏 Ración: {product['serving_size']}"
+                
+                # Save to DB
+                try:
+                    with MiSaludRepo() as repo:
+                        meal = repo.add_meal("Snack", eaten_at=datetime.now(), photo_path=str(photo_path), confidence="high")
+                        food_data = {k: product[k] for k in ["name", "portion_g", "calories", "protein_g", "carbs_g", "fat_g", "fiber_g"]}
+                        food_data["name"] = f"{product['name']} (barcode)"
+                        repo.add_food_to_meal(meal.id, food_data)
+                    msg += "\n\n✅ *Guardado en tus registros*"
+                except Exception as e:
+                    msg += f"\n\n⚠️ Error al guardar: {e}"
+                
+                await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+                return
+            else:
+                await update.message.reply_text("📦 Código de barras detectado pero no encontrado en la base de datos.")
+                return
+
+        # No barcode - proceed with normal food analysis
+        await update.message.reply_text("🔍 *Analizando tu comida con IA...*", parse_mode=ParseMode.MARKDOWN)
         result = self.analyzer.analyze(photo_path)
 
         if "error" in result:
@@ -391,8 +551,6 @@ class MiSaludBot:
         msg = _format_nutrition_result(result)
         msg += f"\n\n📸 _Foto guardada: {photo_path.name}_"
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-    # ── /editar ──────────────────────────────────────
 
     async def editar_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Edit the most recent meal: /editar pollo → atun"""
@@ -608,6 +766,83 @@ class MiSaludBot:
         reply = self.coach.chat(text)
         await update.message.reply_text(reply)
 
+    # ── Voice handler ─────────────────────────────
+
+    async def handle_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Receive voice message, transcribe, and parse as food description."""
+        await update.message.reply_text("🎤 *Procesando mensaje de voz...*", parse_mode=ParseMode.MARKDOWN)
+
+        try:
+            # Download voice file
+            voice = await update.message.voice.get_file()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            voice_path = PHOTOS_DIR / f"voice_{timestamp}.ogg"
+            await voice.download_to_drive(voice_path)
+
+            # Read file as bytes for transcription
+            import base64
+            with open(voice_path, "rb") as f:
+                audio_data = base64.b64encode(f.read()).decode()
+
+            # Use DeepSeek API to transcribe via OpenAI-compatible
+            api_key = (os.getenv("MISALUD_DEEPSEEK_KEY", "") or os.getenv("DEEPSEEK_API_KEY", ""))
+            if not api_key:
+                await update.message.reply_text("❌ No hay API key para transcripción.")
+                return
+
+            # Try OpenAI Whisper API for transcription
+            whisper_headers = {
+                "Authorization": f"Bearer {api_key}",
+            }
+
+            # Send to Whisper API (DeepSeek supports OpenAI-compatible Whisper)
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                tmp_path = tmp.name
+                with open(voice_path, "rb") as src:
+                    tmp.write(src.read())
+
+            try:
+                with open(tmp_path, "rb") as f:
+                    whisper_resp = requests.post(
+                        "https://api.deepseek.com/v1/audio/transcriptions",
+                        headers=whisper_headers,
+                        files={"file": ("voice.ogg", f, "audio/ogg")},
+                        data={"model": "whisper-1", "language": "es"},
+                        timeout=60,
+                    )
+            finally:
+                os.unlink(tmp_path)
+
+            if whisper_resp.status_code != 200:
+                await update.message.reply_text(
+                    f"❌ No pude transcribir el audio (error {whisper_resp.status_code}). "
+                    "Intenta escribir tu comida con /comida."
+                )
+                return
+
+            transcript = whisper_resp.json().get("text", "").strip()
+            if not transcript:
+                await update.message.reply_text("❌ No se detectó texto en el audio.")
+                return
+
+            await update.message.reply_text(
+                f"📝 *Transcripción:* {transcript}\n\n"
+                f"🔄 Analizando...",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+            # Treat the transcript as a food description
+            context.args = transcript.split()
+            await self.comida_cmd(update, context)
+
+        except Exception as e:
+            logger.exception("Voice processing failed")
+            await update.message.reply_text(
+                f"❌ Error al procesar el audio: {e}\n\n"
+                "Prueba con /comida para escribir tu comida."
+            )
+
     # ── Lifecycle ──────────────────────────────────
 
     def build_app(self) -> Application:
@@ -635,9 +870,11 @@ class MiSaludBot:
         app.add_handler(CommandHandler("coach", self.coach_cmd))
         app.add_handler(CommandHandler("reset", self.reset_coach_cmd))
         app.add_handler(CommandHandler("menu", self.menu_cmd))
+        app.add_handler(CommandHandler("receta", self.receta_cmd))
 
-        # Photo handler
+        # Photo handler + voice
         app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
+        app.add_handler(MessageHandler(filters.VOICE, self.handle_voice))
 
         # Text fallback (must be last)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
